@@ -1,0 +1,125 @@
+USE DATABASE SSE_DM_CSG_RPT_PRD;
+
+    WITH base_renewals AS (
+        SELECT
+            op.renewal_opty_id_18,
+            LEFT(op.renewal_opty_id_18, 15) AS opp_id_15,
+            op.renewal_fiscal_qtr,
+            op.renewal_fiscal_year,
+            IFNULL(op.renewal_atr_conv, 0) AS renewal_atr_conv,
+            op.renewal_fcast_attrition_conv,
+            op.book_of_business,
+            op.account_lvl_2_usr_role,
+            op.renewal_stg_nm,
+            op.renewal_opty_type
+        FROM RENEWALS.CI_NEAR_REALTIME_RENEWAL_OPTY_VW op
+        WHERE op.renewal_clsd_dt > CURRENT_DATE()
+          AND op.renewal_fiscal_year = 2027
+          AND op.m_a_legacy_renewal_flag != 'Y'
+          AND op.renewal_fcast_code != 'Closed'
+          AND op.renewal_fcast_code NOT IN ('Omitted')
+          AND (op.renewal_opty_type IN ('Renewal','ISV','Contract') OR
+  op.renewal_opty_type LIKE 'Off-Cycle%')
+          AND op.renewal_fcast_attrition_conv <= 0
+          AND (
+              (op.renewal_30de NOT IN
+  ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE')
+               AND op.renewal_stg_nm IN ('05 Closed','Dead Attrition'))
+              OR op.renewal_stg_nm NOT IN ('05 Closed','Dead Attrition')
+              OR op.renewal_30de IS NULL
+          )
+    ),
+
+    program_tags AS (
+        SELECT DISTINCT
+            LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) AS opp_id_15,
+            p.name AS target_program_name
+        FROM CIDM.CI_RND_PROGRAM_PARTICIPANT_VW pp
+        INNER JOIN CIDM.CI_RND_PROGRAM_VW p
+            ON pp.requested_program = p.ID
+        WHERE p.program_type = 'Renewals'
+          AND p.name NOT LIKE '%Cancelled%'
+          AND p.name LIKE '%RP-FY27%'
+    ),
+
+    program_counts AS (
+        SELECT opp_id_15, COUNT(DISTINCT target_program_name) AS
+  total_programs_assigned
+        FROM program_tags GROUP BY 1
+    ),
+
+    reach_set AS (
+        SELECT
+            'Reach' AS dataset_type,
+            br.renewal_opty_id_18,
+            br.opp_id_15,
+            br.renewal_fiscal_qtr,
+            br.renewal_fiscal_year,
+            br.renewal_atr_conv,
+            br.renewal_fcast_attrition_conv,
+            br.book_of_business,
+            br.account_lvl_2_usr_role,
+            br.renewal_stg_nm,
+            br.renewal_opty_type,
+            pt.target_program_name,
+            pc.total_programs_assigned,
+            br.renewal_atr_conv AS program_atr,
+            br.renewal_fcast_attrition_conv AS program_fcast_attrition
+        FROM base_renewals br
+        INNER JOIN program_tags pt ON br.opp_id_15 = pt.opp_id_15
+        LEFT JOIN program_counts pc ON br.opp_id_15 = pc.opp_id_15
+    ),
+
+    impact_set AS (
+        SELECT
+            'Impact' AS dataset_type,
+            br.renewal_opty_id_18,
+            br.opp_id_15,
+            br.renewal_fiscal_qtr,
+            br.renewal_fiscal_year,
+            br.renewal_atr_conv,
+            br.renewal_fcast_attrition_conv,
+            br.book_of_business,
+            br.account_lvl_2_usr_role,
+            br.renewal_stg_nm,
+            br.renewal_opty_type,
+            pt.target_program_name,
+            pc.total_programs_assigned,
+            br.renewal_atr_conv / NULLIF(pc.total_programs_assigned, 0) AS
+  program_atr,
+            br.renewal_fcast_attrition_conv / NULLIF(pc.total_programs_assigned,
+   0) AS program_fcast_attrition
+        FROM base_renewals br
+        INNER JOIN program_tags pt ON br.opp_id_15 = pt.opp_id_15
+        LEFT JOIN program_counts pc ON br.opp_id_15 = pc.opp_id_15
+    ),
+
+    untagged_set AS (
+        SELECT
+            'Untagged' AS dataset_type,
+            br.renewal_opty_id_18,
+            br.opp_id_15,
+            br.renewal_fiscal_qtr,
+            br.renewal_fiscal_year,
+            br.renewal_atr_conv,
+            br.renewal_fcast_attrition_conv,
+            br.book_of_business,
+            br.account_lvl_2_usr_role,
+            br.renewal_stg_nm,
+            br.renewal_opty_type,
+            NULL AS target_program_name,
+            0 AS total_programs_assigned,
+            br.renewal_atr_conv AS program_atr,
+            br.renewal_fcast_attrition_conv AS program_fcast_attrition
+        FROM base_renewals br
+        LEFT JOIN (SELECT DISTINCT opp_id_15 FROM program_tags) pt ON
+  br.opp_id_15 = pt.opp_id_15
+        WHERE pt.opp_id_15 IS NULL
+    )
+
+    SELECT * FROM reach_set
+    UNION ALL
+    SELECT * FROM impact_set
+    UNION ALL
+    SELECT * FROM untagged_set
+    ORDER BY dataset_type, target_program_name, renewal_opty_id_18;
