@@ -1,0 +1,222 @@
+    USE DATABASE SSE_DM_CSG_RPT_PRD;
+
+    WITH base_data AS (
+        SELECT
+            r.renewal_opty_id_18,
+            LEFT(r.renewal_opty_id_18, 15) AS opp_id_15,
+            r.renewal_fiscal_qtr,
+            IFNULL(r.renewal_atr_conv, 0) AS renewal_atr_conv,
+            NVL(o.SALES_OU, 'Other') AS Sales_OU,
+            NVL(o.SALES_OU_1, 'Other') AS Sales_OU_1,
+            CASE
+                WHEN IFNULL(r.renewal_atr_conv, 0) >= 10000000 THEN '$10M+'
+                WHEN IFNULL(r.renewal_atr_conv, 0) >= 5000000  THEN '$5M-$10M'
+                WHEN IFNULL(r.renewal_atr_conv, 0) >= 1000000  THEN '$1M-$5M'
+                WHEN IFNULL(r.renewal_atr_conv, 0) >= 500000   THEN '$500K-$1M'
+                WHEN IFNULL(r.renewal_atr_conv, 0) >= 100000   THEN
+  '$100K-$500K'
+                WHEN IFNULL(r.renewal_atr_conv, 0) >= 50000    THEN '$50K-$100K'
+                ELSE 'Under $50K'
+            END AS atr_band,
+            r.macro_segment
+        FROM RENEWALS.CI_NEAR_REALTIME_RENEWAL_OPTY_VW r
+        LEFT JOIN RSPS_ANALYTICS.DIM_SALES_HIERARCHY_OU_VW o
+            ON o.account_id = r.account_18_id
+            AND o.book_of_business = r.book_of_business
+            AND r.renewal_close_month BETWEEN o.dbt_valid_from AND
+  o.dbt_valid_to
+        WHERE r.renewal_fiscal_year = 2027
+          AND r.m_a_legacy_renewal_flag != 'Y'
+          AND r.renewal_fcast_code NOT IN ('Omitted')
+          AND (r.renewal_opty_type IN ('Renewal','ISV','Contract') OR
+  r.renewal_opty_type LIKE 'Off-Cycle%')
+          AND r.renewal_fcast_attrition_conv <= 0
+          AND (
+              (r.renewal_30de NOT IN
+  ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE')
+               AND r.renewal_stg_nm IN ('05 Closed','Dead Attrition'))
+              OR r.renewal_stg_nm NOT IN ('05 Closed','Dead Attrition')
+              OR r.renewal_30de IS NULL
+          )
+    ),
+
+    program_tags AS (
+        SELECT DISTINCT
+            LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) AS opp_id_15,
+            p.name AS target_program_name
+        FROM CIDM.CI_RND_PROGRAM_PARTICIPANT_VW pp
+        INNER JOIN CIDM.CI_RND_PROGRAM_VW p
+            ON pp.requested_program = p.ID
+        WHERE p.program_type = 'Renewals'
+          AND p.name NOT LIKE '%Cancelled%'
+          AND p.name LIKE '%RP-FY27%'
+    ),
+
+    base_with_programs AS (
+        SELECT bd.*, pt.target_program_name
+        FROM base_data bd
+        INNER JOIN program_tags pt ON bd.opp_id_15 = pt.opp_id_15
+    ),
+
+    -----------------------------------------------------------------------
+    -- TOTALS at each dimension level (now including quarter)
+    -----------------------------------------------------------------------
+    totals_by_ou AS (
+        SELECT Sales_OU, renewal_fiscal_qtr,
+               SUM(renewal_atr_conv) AS total_atr,
+               COUNT(DISTINCT renewal_opty_id_18) AS total_opps
+        FROM base_data GROUP BY Sales_OU, renewal_fiscal_qtr
+    ),
+    totals_by_ou1 AS (
+        SELECT Sales_OU_1, renewal_fiscal_qtr,
+               SUM(renewal_atr_conv) AS total_atr,
+               COUNT(DISTINCT renewal_opty_id_18) AS total_opps
+        FROM base_data GROUP BY Sales_OU_1, renewal_fiscal_qtr
+    ),
+    totals_by_band AS (
+        SELECT atr_band, renewal_fiscal_qtr,
+               SUM(renewal_atr_conv) AS total_atr,
+               COUNT(DISTINCT renewal_opty_id_18) AS total_opps
+        FROM base_data GROUP BY atr_band, renewal_fiscal_qtr
+    ),
+    totals_by_segment AS (
+        SELECT macro_segment, renewal_fiscal_qtr,
+               SUM(renewal_atr_conv) AS total_atr,
+               COUNT(DISTINCT renewal_opty_id_18) AS total_opps
+        FROM base_data GROUP BY macro_segment, renewal_fiscal_qtr
+    ),
+
+    -----------------------------------------------------------------------
+    -- PROGRAM reach at each dimension level (now including quarter)
+    -----------------------------------------------------------------------
+    prog_by_ou AS (
+        SELECT target_program_name, Sales_OU, renewal_fiscal_qtr,
+               SUM(renewal_atr_conv) AS prog_atr,
+               COUNT(DISTINCT renewal_opty_id_18) AS prog_opps
+        FROM base_with_programs GROUP BY 1, 2, 3
+    ),
+    prog_by_ou1 AS (
+        SELECT target_program_name, Sales_OU_1, renewal_fiscal_qtr,
+               SUM(renewal_atr_conv) AS prog_atr,
+               COUNT(DISTINCT renewal_opty_id_18) AS prog_opps
+        FROM base_with_programs GROUP BY 1, 2, 3
+    ),
+    prog_by_band AS (
+        SELECT target_program_name, atr_band, renewal_fiscal_qtr,
+               SUM(renewal_atr_conv) AS prog_atr,
+               COUNT(DISTINCT renewal_opty_id_18) AS prog_opps
+        FROM base_with_programs GROUP BY 1, 2, 3
+    ),
+    prog_by_segment AS (
+        SELECT target_program_name, macro_segment, renewal_fiscal_qtr,
+               SUM(renewal_atr_conv) AS prog_atr,
+               COUNT(DISTINCT renewal_opty_id_18) AS prog_opps
+        FROM base_with_programs GROUP BY 1, 2, 3
+    ),
+
+    -----------------------------------------------------------------------
+    -- Scaffold
+    -----------------------------------------------------------------------
+    all_programs AS (SELECT DISTINCT target_program_name FROM program_tags),
+
+    scaffold AS (
+        SELECT DISTINCT
+            p.target_program_name,
+            bd.Sales_OU,
+            bd.Sales_OU_1,
+            bd.atr_band,
+            bd.macro_segment,
+            bd.renewal_fiscal_qtr
+        FROM all_programs p
+        CROSS JOIN (SELECT DISTINCT Sales_OU, Sales_OU_1, atr_band,
+  macro_segment, renewal_fiscal_qtr FROM base_data) bd
+    )
+
+    -----------------------------------------------------------------------
+    -- FINAL OUTPUT
+    -----------------------------------------------------------------------
+    SELECT
+        sc.target_program_name                          AS "Program",
+        sc.renewal_fiscal_qtr                           AS "Renewal_Fiscal_Qtr",
+        sc.Sales_OU                                     AS "Sales_OU",
+        sc.Sales_OU_1                                   AS "Sales_OU_1",
+        sc.atr_band                                     AS "ATR_Band",
+        sc.macro_segment                                AS "Macro_Segment",
+
+        -- OU-level reach
+        COALESCE(tou.total_atr, 0)                      AS "OU_Total_ATR",
+        COALESCE(tou.total_opps, 0)                     AS "OU_Total_Opps",
+        COALESCE(pou.prog_atr, 0)                       AS "OU_Program_ATR",
+        COALESCE(pou.prog_opps, 0)                      AS "OU_Program_Opps",
+        ROUND(100.0 * COALESCE(pou.prog_atr, 0)
+            / NULLIF(tou.total_atr, 0), 2)              AS "OU_ATR_Reach_Pct",
+        ROUND(100.0 * COALESCE(pou.prog_opps, 0)
+            / NULLIF(tou.total_opps, 0), 2)             AS "OU_Opps_Reach_Pct",
+
+        -- OU1-level reach
+        COALESCE(tou1.total_atr, 0)                     AS "OU1_Total_ATR",
+        COALESCE(tou1.total_opps, 0)                    AS "OU1_Total_Opps",
+        COALESCE(pou1.prog_atr, 0)                      AS "OU1_Program_ATR",
+        COALESCE(pou1.prog_opps, 0)                     AS "OU1_Program_Opps",
+        ROUND(100.0 * COALESCE(pou1.prog_atr, 0)
+            / NULLIF(tou1.total_atr, 0), 2)             AS "OU1_ATR_Reach_Pct",
+        ROUND(100.0 * COALESCE(pou1.prog_opps, 0)
+            / NULLIF(tou1.total_opps, 0), 2)            AS "OU1_Opps_Reach_Pct",
+
+        -- ATR Band-level reach
+        COALESCE(tb.total_atr, 0)                       AS "Band_Total_ATR",
+        COALESCE(tb.total_opps, 0)                      AS "Band_Total_Opps",
+        COALESCE(pb.prog_atr, 0)                        AS "Band_Program_ATR",
+        COALESCE(pb.prog_opps, 0)                       AS "Band_Program_Opps",
+        ROUND(100.0 * COALESCE(pb.prog_atr, 0)
+            / NULLIF(tb.total_atr, 0), 2)               AS "Band_ATR_Reach_Pct",
+        ROUND(100.0 * COALESCE(pb.prog_opps, 0)
+            / NULLIF(tb.total_opps, 0), 2)              AS
+  "Band_Opps_Reach_Pct",
+
+        -- Macro Segment-level reach
+        COALESCE(ts.total_atr, 0)                       AS "Seg_Total_ATR",
+        COALESCE(ts.total_opps, 0)                      AS "Seg_Total_Opps",
+        COALESCE(ps.prog_atr, 0)                        AS "Seg_Program_ATR",
+        COALESCE(ps.prog_opps, 0)                       AS "Seg_Program_Opps",
+        ROUND(100.0 * COALESCE(ps.prog_atr, 0)
+            / NULLIF(ts.total_atr, 0), 2)               AS "Seg_ATR_Reach_Pct",
+        ROUND(100.0 * COALESCE(ps.prog_opps, 0)
+            / NULLIF(ts.total_opps, 0), 2)              AS "Seg_Opps_Reach_Pct"
+
+    FROM scaffold sc
+    LEFT JOIN totals_by_ou tou     ON sc.Sales_OU = tou.Sales_OU
+                                   AND sc.renewal_fiscal_qtr =
+  tou.renewal_fiscal_qtr
+    LEFT JOIN prog_by_ou pou       ON sc.target_program_name =
+  pou.target_program_name
+                                   AND sc.Sales_OU = pou.Sales_OU
+                                   AND sc.renewal_fiscal_qtr =
+  pou.renewal_fiscal_qtr
+    LEFT JOIN totals_by_ou1 tou1   ON sc.Sales_OU_1 = tou1.Sales_OU_1
+                                   AND sc.renewal_fiscal_qtr =
+  tou1.renewal_fiscal_qtr
+    LEFT JOIN prog_by_ou1 pou1     ON sc.target_program_name =
+  pou1.target_program_name
+                                   AND sc.Sales_OU_1 = pou1.Sales_OU_1
+                                   AND sc.renewal_fiscal_qtr =
+  pou1.renewal_fiscal_qtr
+    LEFT JOIN totals_by_band tb    ON sc.atr_band = tb.atr_band
+                                   AND sc.renewal_fiscal_qtr =
+  tb.renewal_fiscal_qtr
+    LEFT JOIN prog_by_band pb      ON sc.target_program_name =
+  pb.target_program_name
+                                   AND sc.atr_band = pb.atr_band
+                                   AND sc.renewal_fiscal_qtr =
+  pb.renewal_fiscal_qtr
+    LEFT JOIN totals_by_segment ts ON sc.macro_segment = ts.macro_segment
+                                   AND sc.renewal_fiscal_qtr =
+  ts.renewal_fiscal_qtr
+    LEFT JOIN prog_by_segment ps   ON sc.target_program_name =
+  ps.target_program_name
+                                   AND sc.macro_segment = ps.macro_segment
+                                   AND sc.renewal_fiscal_qtr =
+  ps.renewal_fiscal_qtr
+    ORDER BY sc.target_program_name, sc.renewal_fiscal_qtr, sc.Sales_OU,
+  sc.Sales_OU_1, sc.atr_band, sc.macro_segment;
+
