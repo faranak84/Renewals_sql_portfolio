@@ -1,0 +1,955 @@
+/* Base table with relevant information for opties from all programs, including:
+    - Beginning, current, peak attrition forecast
+    - Opty and renewal details */
+
+WITH target_list AS (
+    -- Tagged opportunity list
+    SELECT
+        DISTINCT opt.acct_id AS target_account_id,
+        pp.associated_opportunity AS target_opportunity_id,
+        p.name AS target_program_name,
+        p.start_date AS rnd_start_date,
+        CAST(p.createddate AS DATE) AS target_program_created_date,
+        TRIM(pp.associated_opportunity::VARCHAR) AS opp_id_raw,
+        LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) AS opp_id_15
+    FROM
+        SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_participant_vw pp
+        JOIN SSE_DM_CSG_RPT_PRD.cidm.ci_rnd_program_vw p ON pp.requested_program = p.ID
+        LEFT JOIN EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+            ON LEFT(TRIM(pp.associated_opportunity::VARCHAR), 15) = LEFT(opt.opty_id, 15)
+            AND opt.curr_rec_flg = 'Y'
+            AND opt.del_flg = 'N'
+    WHERE
+        p.program_type = 'Renewals'
+        AND p.name LIKE '%RP-FY27%'
+),
+
+-- Baseline date per opportunity
+baseline_date_map AS (
+    SELECT DISTINCT
+        opp_id_15,
+        target_program_name,
+        rnd_start_date,
+        target_program_created_date AS baseline_dt
+    FROM target_list
+),
+
+-- Distinct program list helper function
+program_list AS (
+    SELECT DISTINCT
+        t.opp_id_15,
+        LISTAGG(DISTINCT t.target_program_name, ', ') WITHIN GROUP (ORDER BY t.target_program_name) AS program_list
+    FROM target_list t
+    GROUP BY t.opp_id_15
+),
+
+-- Opportunity details found only in DIM_OPPORTUNITY_VW
+opty_scope AS (
+    SELECT DISTINCT
+        LEFT(opt.opty_id, 15) AS opp_id_15,
+        opt.acct_id,
+        opt.CLSD_DT,
+        acct.CSM_MANAGER_NM,
+        acct.CSM_FULL_NM,
+        acct.CORE_SUPPORT_LEVEL_NM
+    FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+    LEFT JOIN SSE_DM_CSG_RPT_PRD.CIDM.CI_DIM_ACCOUNT_VW acct ON opt.ACCT_ID = acct.account_id
+    WHERE
+        opt.curr_rec_flg = 'Y'
+        AND opt.del_flg = 'N'
+        AND opt.forcst_cat_cd <> 'Omitted'
+        AND (
+            opt.opty_typ IN ('Renewal', 'Contract')
+            OR opt.opty_typ LIKE 'Off-Cycle%'
+            OR opt.opty_typ LIKE '%ISV%'
+        )
+        AND opt.opty_rec_typ_ky IN ('1506', '1507')
+        AND opt.targeted_clouds <> 'Slack Unmigrated'
+        AND opt.forcst_attrtn_amt <= 0
+        AND acct.account_nm NOT LIKE 'Renewals Off Cycle Forecasting%'
+        AND (
+            (
+                opt.X30_DY_EXT_TXT NOT IN ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE')
+                AND opt.OPTY_STG_NM IN ('05 Closed', 'Dead Attrition')
+            )
+            OR opt.OPTY_STG_NM NOT IN ('05 Closed', 'Dead Attrition')
+            OR opt.X30_DY_EXT_TXT IS NULL
+        )
+),
+
+-- FX for USD conversion
+exchange_rate AS (
+    SELECT
+        fm_crncy_cd,
+        conv_rt
+    FROM EDW_HERITAGE_PRD.DM.DIM_EXCHANGE_RATE_MO_VW_VW
+    WHERE
+        to_crncy_cd = 'USD'
+        AND conv_typ = 'Outlook'
+        AND conv_prd_nm = TO_CHAR(CURRENT_DATE, 'Mon-YY')
+),
+
+-- Initial attrition forecast at the time opty was tagged for program
+beginning AS (
+    SELECT
+        LEFT(opt.opty_id, 15) AS opp_id_15,
+        bdm.baseline_dt,
+        ROUND(IFNULL(opt.FORCST_ATTRTN_AMT, 0) * IFNULL(crncy.conv_rt, 1), 2) AS beginning_attrition,
+        ROW_NUMBER() OVER (
+            PARTITION BY LEFT(opt.opty_id, 15), bdm.baseline_dt
+            ORDER BY opt.REC_STRT_DT DESC, opt.dim_opty_ky DESC
+        ) AS rn
+    FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+    JOIN baseline_date_map bdm ON LEFT(opt.opty_id, 15) = bdm.opp_id_15
+    LEFT JOIN exchange_rate crncy ON opt.crncy_cd = crncy.fm_crncy_cd
+    WHERE
+        opt.del_flg = 'N'
+        AND opt.REC_STRT_DT <= bdm.baseline_dt
+),
+
+-- Current (or final) attrition forecast
+current_rec AS (
+    SELECT
+        LEFT(opt.opty_id, 15) AS opp_id_15,
+        opt.CLSD_DT,
+        opt.OPTY_STG_NM,
+        opt.forcst_cat_cd,
+        ROUND(IFNULL(opt.FORCST_ATTRTN_AMT, 0) * IFNULL(crncy.conv_rt, 1), 2) AS current_attrition,
+        ROW_NUMBER() OVER (
+            PARTITION BY LEFT(opt.opty_id, 15)
+            ORDER BY opt.REC_STRT_DT DESC, opt.dim_opty_ky DESC
+        ) AS rn
+    FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+    LEFT JOIN exchange_rate crncy ON opt.crncy_cd = crncy.fm_crncy_cd
+    WHERE
+        opt.curr_rec_flg = 'Y'
+        AND opt.del_flg = 'N'
+        AND LEFT(opt.opty_id, 15) IN (SELECT DISTINCT opp_id_15 FROM target_list)
+),
+
+-- Peak attrition forecast seen through opty lifecycle
+max_risk AS (
+    SELECT
+        LEFT(opt.opty_id, 15) AS opp_id_15,
+        MIN(ROUND(IFNULL(opt.FORCST_ATTRTN_AMT, 0) * IFNULL(crncy.conv_rt, 1), 2)) AS max_risk_observed
+    FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+    JOIN baseline_date_map bdm ON LEFT(opt.opty_id, 15) = bdm.opp_id_15
+    LEFT JOIN exchange_rate crncy ON opt.crncy_cd = crncy.fm_crncy_cd
+    WHERE
+        opt.del_flg = 'N'
+        AND opt.REC_STRT_DT <= sysdate()
+        AND CASE WHEN opt.REC_END_DT = '9999-12-31 00:00:00.000' THEN sysdate() ELSE opt.REC_END_DT END >= bdm.baseline_dt
+        AND opt.forcst_attrtn_amt <= 0
+    GROUP BY LEFT(opt.opty_id, 15)
+),
+
+-- Peak swing seen through opty lifecycle
+max_swing AS (
+    SELECT
+        LEFT(opt.opty_id, 15) AS opp_id_15,
+        MAX(ROUND(IFNULL(opt.CONVERTED_SWING_AMT, 0) * IFNULL(crncy.conv_rt, 1), 2)) AS max_swing
+    FROM EDW_HERITAGE_PRD.DM.DIM_OPPORTUNITY_VW opt
+    JOIN baseline_date_map bdm ON LEFT(opt.opty_id, 15) = bdm.opp_id_15
+    LEFT JOIN exchange_rate crncy ON opt.crncy_cd = crncy.fm_crncy_cd
+    WHERE
+        opt.del_flg = 'N'
+        AND opt.REC_STRT_DT <= sysdate()
+        AND CASE WHEN opt.REC_END_DT = '9999-12-31 00:00:00.000' THEN sysdate() ELSE opt.REC_END_DT END >= bdm.baseline_dt
+        AND opt.forcst_attrtn_amt <= 0
+    GROUP BY LEFT(opt.opty_id, 15)
+),
+
+-- Renewal details from WV_CI_RENEWAL_OPTY_VW
+renewal_detail AS (
+    SELECT
+        LEFT(r.RENEWAL_OPTY_ID, 15) AS opp_id_15,
+        r.RENEWAL_OPTY_ID AS renewal_opty_id_18,
+        r.RENEWAL_PRIOR_CNTR_ID,
+        r.RENEWAL_PRIOR_CONTRACT_NBR,
+        r.RENEWAL_OPTY_NM,
+        r.ACCOUNT_NM,
+        r.RENEWAL_OPTY_TYPE,
+        r.AE_ROLE_NM,
+        r.COMBO_COMPANY_ID,
+        r.COMBO_COMPANY_NM,
+        r.SELA_BILLABLE_FLAG,
+        r.CSG_TERRITORY,
+        r.CSG_AREA,
+        r.CSG_GEO,
+        r.CSG_PORTFOLIO,
+        r.TEAM_TERRITORY,
+        r.ACCOUNT_LVL_1_USR_NM,
+        r.ACCOUNT_LVL_2_USR_NM,
+        r.ACCOUNT_LVL_3_USR_NM,
+        r.ACCOUNT_LVL_4_USR_NM,
+        r.ACCOUNT_LVL_1_USR_ROLE,
+        r.ACCOUNT_LVL_2_USR_ROLE,
+        r.ACCOUNT_LVL_3_USR_ROLE,
+        r.ACCOUNT_LVL_4_USR_ROLE,
+        r.ACCOUNT_LVL_5_USR_NM,
+        r.ACCOUNT_LVL_6_USR_NM,
+        r.ACCOUNT_LVL_7_USR_NM,
+        r.ACCOUNT_LVL_5_USR_ROLE,
+        r.ACCOUNT_LVL_6_USR_ROLE,
+        r.ACCOUNT_LVL_7_USR_ROLE,
+        r.RENEWAL_AMT_CONV,
+        r.RENEWAL_ATR_CONV,
+        r.RENEWAL_FCAST_ATTRITION_CONV,
+        r.CONV_SWING_AMT,
+        r.ROR_APPROVED_AMT,
+        r.RENEWAL_FISCAL_YEAR,
+        r.RENEWAL_FISCAL_QTR,
+        r.RENEWAL_CLOSE_MONTH,
+        r.RENEWAL_CLSD_DT,
+        r.RENEWAL_CONTRACT_END_DATE,
+        r.RENEWAL_KEY_RISK_CAT,
+        r.geo,
+        CURRENT_DATE() AS current_dt,
+        r.src_crte_dt AS create_dt,
+        r.OPPTY_USR_ID,
+        r.RENEWAL_OPTY_OWNR_NM AS renewal_manager,
+        r.RENEWAL_30DE,
+        CASE WHEN DAYOFWEEK(CURRENT_DATE()) = 1 THEN 1 ELSE 0 END AS is_monday,
+        CASE
+            WHEN r.RENEWAL_OPTY_TYPE IN ('Contract', 'Renewal') THEN 'Oncycle'
+            WHEN r.RENEWAL_OPTY_TYPE LIKE 'Off-Cycle%' THEN 'Offcycle'
+            WHEN r.RENEWAL_OPTY_TYPE = 'ISV' THEN 'ISV'
+            ELSE 'Oncycle'
+        END AS opportunity_type,
+        u.MGR_FRST_NM AS rmm_first_name,
+        u.MGR_LST_NM AS rmm_last_name,
+        CONCAT(u.MGR_FRST_NM, ' ', u.MGR_LST_NM) AS rmm_full_name,
+        NVL(o.SALES_OU,'Other') as SALES_OU,
+        NVL(o.SALES_OU_1,'Other') as SALES_OU_1,
+        r.MACRO_SEGMENT,
+        r.ACCT_AOV_BAND
+    FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW r
+    LEFT JOIN SSE_DM_CSG_RPT_PRD.RSPS_ANALYTICS.DIM_SALES_HIERARCHY_OU_VW o
+        ON o.account_id = r.account_18_id
+        AND o.book_of_business = r.book_of_business
+        AND r.renewal_close_month BETWEEN o.dbt_valid_from and o.dbt_valid_to
+    LEFT JOIN EDW_PRD.DM.DIM_USER_ORG62_SV u
+        ON r.OPPTY_USR_ID = u.USR_ID_15
+        AND u.CURR_REC_FLG = 'Y'
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY LEFT(r.RENEWAL_OPTY_ID, 15)
+        ORDER BY r.RENEWAL_FISCAL_YEAR DESC, r.RENEWAL_FISCAL_QTR DESC
+    ) = 1
+),
+
+programs_opty_renewals AS (
+    SELECT
+        t.target_account_id AS account_id,
+        LEFT(TRIM(t.target_opportunity_id::VARCHAR), 15) AS opportunity_id,
+        t.target_program_name AS program_name,
+
+        CASE WHEN t.target_program_name = 'Ad Studio to D360 (RP-FY27)' THEN 'Social, Audience, Advertising (EOS)'
+             WHEN t.target_program_name = 'Agentforce Retention Program (RP-FY27)' THEN 'Agentforce, Flex Credits'
+             WHEN t.target_program_name = 'CC AOV Protection (RP-FY27)' THEN 'B2C Commerce (B2Ce)'
+             WHEN t.target_program_name = 'CRMA AOV Protection (RP-FY27)' THEN 'CRM Analytics'
+             WHEN t.target_program_name = 'MC AOV Protection (RP-FY27)' THEN 'Super Messages'
+             WHEN t.target_program_name = 'Signature Retention Program (RP-FY27)' THEN 'Signature'
+             WHEN t.target_program_name = 'Mulesoft Retention Program (RP-FY27)' THEN 'Integration'
+             WHEN t.target_program_name = 'MuleSoft Swap Informatica (RP-FY27)' THEN 'Integration'
+             WHEN t.target_program_name = 'Whatsapp Retention LATAM & APAC (RP-FY27)' THEN 'WhatsApp Business Messaging'
+             WHEN t.target_program_name = 'Top MuleSoft & Tableau OnPrem - cRPO Increase (RP-FY27)' THEN 'Tableau, MuleSoft'
+            END AS apm_attrit_aov_map,
+
+        CASE WHEN t.target_program_name = 'Mulesoft Retention Program (RP-FY27)' THEN 'MuleSoft'
+             WHEN t.target_program_name = 'Mulesoft Swap Informatica (RP-FY27)' THEN 'MuleSoft'
+            END AS cloud_attrit_map,
+
+        CASE WHEN t.target_program_name = 'Ad Studio to D360 (RP-FY27)' THEN 'D360'
+             --WHEN t.target_program_name = 'CC AOV Protection (RP-FY27)' THEN 'Commerce Cloud B2C Premium'
+             WHEN t.target_program_name = 'CRMA AOV Protection (RP-FY27)' THEN 'Tableau'
+             --WHEN t.target_program_name = 'MC AOV Protection (RP-FY27)' THEN 'MC Next-Gen'
+             WHEN t.target_program_name = 'MuleSoft Swap Informatica (RP-FY27)' THEN 'INFA'
+            END AS prod_swap_in_map,
+
+        pl.program_list AS program_list,
+        t.rnd_start_date,
+        rd.Sales_OU,
+        rd.Sales_OU_1,
+        s.acct_id AS acct_id_from_opty_scope,
+        s.CSM_MANAGER_NM,
+        s.CSM_FULL_NM,
+        s.CORE_SUPPORT_LEVEL_NM,
+        rd.RENEWAL_PRIOR_CNTR_ID as cntr_id,
+        rd.RENEWAL_PRIOR_CONTRACT_NBR as cntr_nbr,
+        rd.RENEWAL_OPTY_NM AS opportunity_name,
+        rd.ACCOUNT_NM AS account_name,
+        rd.AE_ROLE_NM,
+        rd.COMBO_COMPANY_ID,
+        rd.COMBO_COMPANY_NM,
+        rd.SELA_BILLABLE_FLAG,
+        rd.ACCOUNT_LVL_5_USR_NM,
+        rd.ACCOUNT_LVL_6_USR_NM,
+        rd.ACCOUNT_LVL_7_USR_NM,
+        rd.ACCOUNT_LVL_5_USR_ROLE,
+        rd.ACCOUNT_LVL_6_USR_ROLE,
+        rd.ACCOUNT_LVL_7_USR_ROLE,
+        rd.renewal_manager,
+        rd.rmm_first_name,
+        rd.rmm_last_name,
+        rd.rmm_full_name,
+        rd.RENEWAL_30DE,
+        rd.opportunity_type,
+        cur.OPTY_STG_NM AS stage,
+        cur.forcst_cat_cd AS Forecast_Category,
+        rd.RENEWAL_KEY_RISK_CAT,
+        rd.RENEWAL_FISCAL_YEAR,
+        rd.RENEWAL_FISCAL_QTR,
+        rd.RENEWAL_CLOSE_MONTH,
+        rd.RENEWAL_CLSD_DT,
+        CASE
+            WHEN MONTH(rd.RENEWAL_CLSD_DT) = 1 THEN YEAR(rd.RENEWAL_CLSD_DT)
+            ELSE YEAR(rd.RENEWAL_CLSD_DT) + 1
+        END AS close_dt_fiscal_year,
+        CASE
+            WHEN MONTH(rd.RENEWAL_CLSD_DT) IN (2, 3, 4) THEN 'Q1'
+            WHEN MONTH(rd.RENEWAL_CLSD_DT) IN (5, 6, 7) THEN 'Q2'
+            WHEN MONTH(rd.RENEWAL_CLSD_DT) IN (8, 9, 10) THEN 'Q3'
+            WHEN MONTH(rd.RENEWAL_CLSD_DT) IN (11, 12, 1) THEN 'Q4'
+        END AS close_dt_fiscal_qtr,
+        TO_CHAR(rd.RENEWAL_CLSD_DT, 'Mon') AS close_dt_calendar_month,
+        rd.RENEWAL_CONTRACT_END_DATE,
+        bdm.baseline_dt AS baseline_date,
+        IFNULL(b.beginning_attrition, 0) AS beginning_attrition,
+        IFNULL(cur.current_attrition, 0) AS current_attrition,
+        CASE
+          WHEN rd.RENEWAL_ATR_CONV IS NULL OR rd.RENEWAL_ATR_CONV = 0
+              THEN IFNULL(mr.max_risk_observed, 0)
+          ELSE GREATEST(
+              IFNULL(mr.max_risk_observed, 0),
+              -1 * ABS(rd.RENEWAL_ATR_CONV)
+          ) END AS max_risk_observed,
+        ms.max_swing,
+        max_risk_observed - current_attrition AS delta_attrition,
+        rd.RENEWAL_AMT_CONV,
+        rd.RENEWAL_ATR_CONV,
+        rd.CONV_SWING_AMT,
+        rd.ROR_APPROVED_AMT,
+        rd.ACCT_AOV_BAND,
+        rd.MACRO_SEGMENT,
+        rd.current_dt,
+        rd.create_dt
+    FROM target_list t
+    LEFT JOIN baseline_date_map bdm  ON t.opp_id_15 = bdm.opp_id_15 AND t.target_program_name= bdm.target_program_name
+    LEFT JOIN program_list pl        ON t.opp_id_15 = pl.opp_id_15
+    LEFT JOIN opty_scope s           ON t.opp_id_15 = s.opp_id_15
+    LEFT JOIN beginning b            ON t.opp_id_15 = b.opp_id_15 AND b.baseline_dt = bdm.baseline_dt AND b.rn = 1
+    LEFT JOIN current_rec cur        ON t.opp_id_15 = cur.opp_id_15 AND cur.rn = 1
+    LEFT JOIN renewal_detail rd      ON t.opp_id_15 = rd.opp_id_15
+    LEFT JOIN max_risk mr            ON t.opp_id_15 = mr.opp_id_15
+    LEFT JOIN max_swing ms           ON t.opp_id_15 = ms.opp_id_15
+),
+
+-------------- INTEGRATED SELA/PRODUCT RENEWAL CTEs FOR PRODUCT ATR -------------------
+
+-- fact_aov base table used for product ATR and before/after AOV checks
+fact_aov_base AS (
+    SELECT
+        global_co_combo_id,
+        dt_key,
+        cntr_id,
+        cntr_end_dt,
+        ord_itm_end_dt,
+        -- Evaluate all conditions and pack the matched alias names into an array
+        ARRAY_CONSTRUCT_COMPACT(
+            CASE WHEN l4_prod_offering LIKE '%Signature%' THEN 'Signature' END,
+            CASE WHEN prod_sku IN ('200012762','200012764','200012765','211102210','200005944','200005947') THEN 'Social, Audience, Advertising (EOS)' END,
+            CASE WHEN drvd_prod_lvl_2 = 'Agentforce' THEN 'Agentforce' END,
+            CASE WHEN drvd_prod_lvl_2 = 'Flex Credits' THEN 'Flex Credits' END,
+            CASE WHEN prod_sku IN ('200000769', '200000770', '200000771', '200000781', '200000782', '200000783',
+                '200000793', '200000794', '200000795', '200000797', '200000796', '200000798',
+                '200000915', '200000921', '200000922', '200000920', '200000918', '200000917',
+                '200000919', '200000916', '200012995', '200012985', '200012984', '200012983',
+                '200012982', '200012939', '200012938', '200013053', '200013054', '200013055',
+                '200013056', '200013057', '200013058', '200012932', '200012933', '200003922',
+                '200003923', '200003925', '200003926', '200001204', '200001318', '200008900',
+                '200008904') THEN 'B2C Commerce (B2Ce)' END,
+            CASE WHEN prod_sku IN ('200004032', '200004033', '200004035', '200004036', '200008811', '200008812',
+                '200004557', '200004556', '200003643', '200003644', '200003630', '200003631',
+                '200003632', '200003641', '200003642', '200003640', '200003633', '200003915',
+                '200003913', '200003914', '200008198', '200003114', '200003339', '200003333',
+                '200003392', '200003342', '200003393', '200003399', '200002130', '200002107',
+                '200013626', '200013635', '200013628', '200013629', '200013618', '200014048',
+                '100005813', '100006131', '200001287', '200013167', '100001510', '100001738',
+                '200000268', '200005750', '100005889', '200000676', '200014036', '100002944',
+                '100005345', '200000675', '200012849', '200014015', '100001739', '200012850',
+                '211102237', '200014047', '100005885', '200014143', '100002833', '200000845',
+                '200000940', '200013204', '100002945', '200014014', '100004327', '100005864',
+                '200008083', '200001164', '200013213', '100006129', '200005796', '200000462',
+                '200000139', '200002943', '200000465', '200014144', '100002425', '200000926',
+                '100002426', '100002529', '200008081', '100005896', '100001866', '100002830',
+                '200012845', '100005855', '200005799', '200013279', '100002831', '100002993',
+                '200014046', '100005861', '200002863', '200012846', '100003667', '700000100',
+                '200000927', '200000924', '200012848', '200001162', '200014136', '211102240',
+                '200000463', '200000458', '200000141', '200000903', '200005064', '200000142',
+                '200000122', '200005745', '200001564', '200013278', '200000843', '200003010',
+                '200000848', '100005344', '100005860', '200000844', '200013232', '200000680',
+                '200005795', '200008078', '100002428', '200000904', '100005064', '200000678',
+                '100003664', '100002832', '100002773', '200008079', '211102235', '200000923',
+                '100005862', '200000928', '200008087', '100005091', '200008080', '200000846',
+                '100002774', '100005856', '200013234', '100003076', '200014049', '100002817',
+                '200000114', '100005499', '211102239', '200008084', '211102223', '200000460',
+                '200014043', '100002772', '100001462', '200001163', '100005969', '100002994',
+                '200001170', '100005803', '200002864', '100006001', '100012895', '100002528',
+                '100003791', '100002992', '100005858', '200014037', '200000494', '200000459',
+                '200005100', '200005797', '100005894', '100001865', '200002945', '200002944',
+                '200002862', '100005857', '200014051', '200000591', '100001287', '211102236',
+                '200000679', '200001171', '100005802', '200013275', '100002816', '100005606',
+                '100001567', '200005736', '100005892', '100003665', '100006127', '100003078',
+                '200001172', '200000847', '200008086', '100002943', '200000495', '211102238',
+                '200000677', '200005099', '200014012', '200013233', '100006128', '100003658',
+                '100003666', '200001568', '100005863', '200005798', '100005893', '200013211',
+                '200008074', '100005859', '100003421', '200000457', '100005804', '200000925',
+                '200013280', '200013212', '200013276', '200008085', '200005932', '200000905',
+                '200014042', '200000466', '200008077', '200013277', '200000461', '100002938',
+                '700000099', '100006130', '200008082', '200000941', '200013034', '200000140',
+                '100005814', '100003422', '200000123', '200012847', '200000464', '100001564',
+                '200013601', '200013600', '200013617', '200013642', '200013636', '200013684',
+                '200013685', '200013637', '200013686', '200013641', '200013639', '200013640',
+                '200013638', '200013683', '200002129', '200002131', '200003062', '200003063',
+                '200003321', '200003320', '200003345', '200003395', '200003336', '200003340',
+                '200003400', '200003337', '200003344', '200003341', '200003322', '200003343',
+                '200003334', '200003338', '200003335', '200003394', '200003135', '200003137',
+                '200003136', '200003116', '200003115', '200008197', '200008439', '200008605',
+                '200008381', '200008438', '200008593', '200008603', '200008625', '200008607',
+                '200008443', '200008386', '200008444', '200008606', '200008604', '200008384',
+                '200008385', '200008626', '200008624', '200008383', '200008440', '200008380',
+                '200008623', '200008382', '200008602', '200003245', '200003246', '200003244',
+                '200003247', '200003231', '200003230') THEN 'CRM Analytics' END,
+            CASE WHEN prod_sku IN ('200006126', '200000973', '200006903', '100003563', '200001664',
+                '200008688', '200007056', '200001734', '200008850', '200004193', '100004965') THEN 'Super Messages' END,
+            CASE WHEN drvd_prod_lvl_1 = 'Integration' THEN 'Integration' END,
+            CASE WHEN prod_sku IN ('200000810','200001496','200001497','200008690','200008691') THEN 'WhatsApp Business Messaging' END,
+            CASE WHEN prod_sku IN ('100006225', '100006226', '100006822', '100006823', '100006824', '100006825', '100006826', '100006827',
+                       '100006828', '100006829', '100006845', '200001364', '200001365', '200001366', '200003701', '200003702',
+                       '200003704', '200003705', '200003707', '200003708', '200003729', '200003730', '200003731', '200003732',
+                       '200003733', '200003734', '200003735', '200003736', '200003737', '200003738', '200003739', '200003740',
+                       '200003741', '200003742', '200003743', '200003744', '200003745', '200003746', '200003747', '200003748',
+                       '200003749', '200003750', '200003751', '200003752', '200003753', '200003754', '200003755', '200003761',
+                       '200003762', '200003763', '200003764', '200003765', '200003766', '200003767', '200003768', '200003771',
+                       '200003776', '200003789', '200003790', '200003791', '200003792', '200003793', '200003794', '200003795',
+                       '200003796', '200003797', '200003798', '200003809', '200003821', '200003822', '200003824', '200003825',
+                       '200003826', '200003827', '200003828', '200003829', '200003830', '200003831', '200003832', '200003833',
+                       '200003834', '200003836', '200003839', '200003841', '200003844', '200003846', '200003849', '200003851',
+                       '200004288', '200004341', '200004342', '200004343', '200004344', '200004346', '200004347', '200004349',
+                       '200004351', '200004353', '200004354', '200004597', '200004598', '200007436', '200007437', '200007439',
+                       '200007440', '200007441', '200007442', '200007443', '200007445', '200007446', '200007447', '200007448',
+                       '200007449', '200007451', '200007452', '200007453', '200007454', '200007455', '200007457', '200007458',
+                       '200007459', '200007460', '200007461', '200007463', '200007464', '200007465', '200007466', '200007467',
+                       '200007470', '200007471', '200007472', '200007473', '200007474', '200007475', '200007476', '200007477',
+                       '200007478', '200007479', '200007480', '200007481', '200007482', '200007483', '200007484', '200007485',
+                       '200007486', '200007487', '200007488', '200007489', '200007490', '200007491', '200007492', '200007493',
+                       '200007501', '200007502', '200007504', '200007505', '200007507', '200007508', '200007510', '200007511',
+                       '200007513', '200007514', '200007516', '200007517', '200007522', '200007530', '200007531', '200007532',
+                       '200007533', '200007534', '200007535', '200007537', '200007540', '200007542', '200007543', '200007544',
+                       '200007545', '200007546', '200007547', '200007550', '200007551', '200007552', '200007553', '200007554',
+                       '200007555', '200007556', '200007557', '200007558', '200007559', '200007560', '200007561', '200007568',
+                       '200007569', '200007570', '200007571', '200007572', '200007573', '200007574', '200007575', '200007576',
+                       '200007577', '200007578', '200007579', '200007580', '200007581', '200007596', '200007597', '200007598',
+                       '200007599', '200007600', '200007601', '200007602', '200007603', '200007604', '200007605', '200007606',
+                       '200007607', '200007608', '200007609', '200007612', '200007613', '200007614', '200007615', '200007617',
+                       '200007619', '200007620', '200007621', '200007622', '200007623', '200007624', '200007630', '200007643',
+                       '200007644', '200007645', '200007660', '200007661', '200007662', '200007663', '200007664', '200007665',
+                       '200007666', '200007667', '200007668', '200007669', '200008264', '200008265', '200008266', '200008267',
+                       '210000010', '210000011', '210000014', '210000015', '210000018', '210000019', '210000022', '210000023',
+                       '210000026', '210000027', '210000028', '210000029', '210000030', '210000031', '210000032', '210000033',
+                       '210000034', '210000035', '210000038', '210000039', '210000040', '210000041', '210000042', '210000044',
+                       '210000045', '210000048', '210000049', '210000050', '210000051', '210000052', '210000054', '210000055',
+                       '210000058', '210000059', '210000066') OR drvd_prod_lvl_2 = 'Tableau Server' THEN 'Tableau, MuleSoft' END
+        ) AS matched_products_array,
+
+        SUM(IFNULL(alloc_aov, 0)) AS alloc_aov
+    FROM edw_heritage_prd.dm.fact_aov_ss_vw
+    GROUP BY ALL
+    HAVING SUM(qty) > 0
+),
+
+-- 1. fact_aov_atr for non-sela and sela contract process
+fact_aov_atr AS (
+    SELECT
+        p.global_co_combo_id,
+        p.cntr_id,
+        p.cntr_end_dt,
+        p.ord_itm_end_dt,
+        p.dt_key,
+        -- Extract the product alias from the flattened array
+        CASE WHEN f.value::STRING = 'Agentforce' THEN 'Agentforce, Flex Credits'
+             WHEN f.value::STRING = 'Flex Credits' THEN 'Agentforce, Flex Credits'
+             ELSE f.value::STRING END AS product,
+        ROUND(SUM(p.alloc_aov),2) AS alloc_aov
+    FROM fact_aov_base p,
+    LATERAL FLATTEN(input => p.matched_products_array) f -- FLATTEN takes the array and creates a new row for each product match
+    GROUP BY ALL
+),
+
+-- 2. clsd_cntr_non_sela
+clsd_cntr_non_sela AS (
+    SELECT DISTINCT
+        aov.dt_key,
+        aov.cntr_id,
+        aov.global_co_combo_id,
+        'N' AS is_sela,
+        '' AS comm_cntr_id,
+        DATE(aov.cntr_end_dt) AS cntr_end_dt,
+        aov.product,
+        SUM(aov.alloc_aov) AS aov
+    FROM EDW_HERITAGE_PRD.DM.DIM_CONTRACT_VW c
+    INNER JOIN fact_aov_atr aov ON c.cntr_id = aov.cntr_id
+    WHERE c.cntr_end_dt < CURRENT_DATE
+      AND aov.ord_itm_end_dt < CURRENT_DATE
+      AND c.sela_contract IS NULL
+    GROUP BY ALL
+),
+
+-- 3. sela_orders
+sela_orders AS (
+    SELECT DISTINCT
+        s.cntr_id,
+        DATE(s.cntr_end_dt) AS cntr_end_dt,
+        s.sela_contract,
+        o.sfdcrelatedquote__c,
+        r.rec_nm
+    FROM EDW_HERITAGE_PRD.DM.DIM_CONTRACT_VW s
+    LEFT JOIN edw_prd.ods.order_sv o ON SUBSTR(o.contractid, 1, 15) = s.cntr_id
+    JOIN edw_heritage_prd.ods.ods_apttus_proposal_c_vw e ON e.id = o.sfdcrelatedquote__c
+    JOIN edw_heritage_prd.dm.dim_record_type_vw r ON r.rec_typ_id = e.recordtypeid
+    WHERE s.sela_contract IS NOT NULL
+      AND o.sfdcrelatedquote__c IS NOT NULL
+      AND s.cntr_stat_txt NOT LIKE 'Terminated%'
+      AND o.type != 'Cancel'
+),
+
+-- 4. sela_map (commissionable vs billable)
+sela_map AS (
+    SELECT DISTINCT
+        b.sfdcrelatedquote__c,
+        b.rec_nm,
+        b.cntr_id AS sela_billable,
+        c.cntr_id AS sela_commissionable,
+        c.cntr_end_dt
+    FROM sela_orders b
+    LEFT JOIN sela_orders c
+        ON b.sfdcrelatedquote__c = c.sfdcrelatedquote__c
+        AND c.sela_contract = 'SELA Commissionable'
+    WHERE b.sela_contract = 'SELA Billable'
+),
+
+-- 5. clsd_sela_comm_cntr
+clsd_sela_comm_cntr AS (
+    SELECT DISTINCT
+        aov.dt_key,
+        s.sela_commissionable AS comm_cntr_id,
+        s.cntr_end_dt,
+        'Y' AS is_sela,
+        aov.global_co_combo_id,
+        aov.product,
+        SUM(aov.alloc_aov) AS aov
+    FROM (SELECT DISTINCT sela_commissionable, cntr_end_dt FROM sela_map) s
+    INNER JOIN fact_aov_atr aov ON s.sela_commissionable = aov.cntr_id
+    WHERE s.cntr_end_dt < CURRENT_DATE
+      AND aov.ord_itm_end_dt < CURRENT_DATE
+    GROUP BY ALL
+),
+
+-- 6. prod_cntr (Combines Non-SELA & SELA contracts)
+prod_cntr AS (
+    SELECT DISTINCT
+        renewal_opty_id_18,
+        LEFT(renewal_opty_id_18, 15) AS opp_id_15, -- Helper column for final join
+        cntr_id,
+        is_sela,
+        dt_key,
+        cntr_end_dt,
+        global_co_combo_id,
+        product,
+        SUM(aov) AS prod_atr,
+        'non sela' AS data_source
+    FROM (
+        SELECT DISTINCT
+            c.dt_key,
+            r.renewal_opty_id_18,
+            r.renewal_clsd_dt,
+            r.renewal_opty_Type,
+            c.cntr_id,
+            c.comm_cntr_id,
+            c.cntr_end_dt,
+            c.IS_SELA,
+            c.global_co_combo_id,
+            c.product,
+            c.AOV
+        FROM clsd_cntr_non_sela c
+        JOIN renewals.wv_ci_renewal_opty_vw r ON substr(r.renewal_prior_cntr_id,1,15) = c.cntr_id
+        WHERE trunc(r.renewal_clsd_dt, 'MONTH') = add_months(c.dt_key,1)
+           AND r.renewal_fcast_code NOT IN ('Omitted')
+           AND (r.renewal_opty_type = 'Renewal' OR r.renewal_opty_type = 'ISV' OR r.renewal_opty_type = 'Contract' OR r.renewal_opty_type LIKE 'Off-Cycle%')
+           AND (r.renewal_fcast_attrition_conv <= 0)
+           AND (((r.renewal_30de NOT IN ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE')
+           AND r.renewal_stg_nm IN ('05 Closed','Dead Attrition'))
+           OR r.renewal_stg_nm NOT IN ('05 Closed','Dead Attrition'))
+           OR r.renewal_30de IS NULL)
+    )
+    GROUP BY ALL
+
+    UNION ALL
+
+    SELECT DISTINCT
+        renewal_opty_id_18,
+        LEFT(renewal_opty_id_18, 15) AS opp_id_15,
+        sela_billable AS cntr_id,
+        is_sela,
+        dt_key,
+        cntr_end_dt,
+        global_co_combo_id,
+        product,
+        SUM(aov) AS prod_atr,
+        'sela' AS data_source
+    FROM (
+        SELECT DISTINCT
+            c.dt_key,
+            r.renewal_opty_id_18,
+            r.renewal_clsd_dt,
+            r.renewal_opty_Type,
+            s.sela_billable,
+            c.comm_cntr_id,
+            c.cntr_end_dt,
+            c.IS_SELA,
+            c.global_co_combo_id,
+            c.product,
+            c.AOV,
+            DENSE_RANK() OVER(PARTITION BY comm_cntr_id ORDER BY dt_key DESC) AS rank_for_aov
+        FROM clsd_sela_comm_cntr c
+        JOIN sela_map s ON c.comm_cntr_id = s.sela_commissionable
+        JOIN renewals.wv_ci_renewal_opty_vw r ON substr(r.renewal_prior_cntr_id,1,15) = s.sela_billable
+        WHERE trunc(r.renewal_clsd_dt, 'MONTH') = add_months(c.dt_key,1)
+           AND r.renewal_fcast_code NOT IN ('Omitted')
+           AND (r.renewal_opty_type = 'Renewal' OR r.renewal_opty_type = 'ISV' OR r.renewal_opty_type = 'Contract' OR r.renewal_opty_type LIKE 'Off-Cycle%')
+           AND (r.renewal_fcast_attrition_conv <= 0)
+           AND (((r.renewal_30de NOT IN ('1','2','3','4','5','6','7','8','9','10','11','12','13','i30DE')
+           AND r.renewal_stg_nm IN ('05 Closed','Dead Attrition'))
+           OR r.renewal_stg_nm NOT IN ('05 Closed','Dead Attrition'))
+           OR r.renewal_30de IS NULL)
+    )
+    WHERE rank_for_aov = 1
+    GROUP BY ALL
+),
+
+-- Secondary CTE used to pull in product AOV at risk by contract ID only
+fact_aov_atr_2 AS (
+    SELECT
+        p.global_co_combo_id,
+        p.cntr_id,
+        ADD_MONTHS(p.dt_key, -1) AS dt_key,
+        CASE WHEN f.value::STRING = 'Agentforce' THEN 'Agentforce, Flex Credits'
+             WHEN f.value::STRING = 'Flex Credits' THEN 'Agentforce, Flex Credits'
+             ELSE f.value::STRING END AS product,
+        ROUND(SUM(p.alloc_aov),2) AS prod_atr
+    FROM fact_aov_base p,
+    LATERAL FLATTEN(input => p.matched_products_array) f
+    GROUP BY ALL
+),
+
+-------------------- PROTECTION PROGRAMS LOGIC -------------------------
+
+-- PRODUCT LEVEL ATTRITION
+-- Product level attrition snapshots at apm level 3 granularity.
+apm AS (
+    SELECT  -- Final query to aggregate apm attrition by program criteria
+        a.combo_company_id,
+        a.snapshot_dt,
+        a.apm_criteria,
+        ROUND(SUM(a.attrition),2) as apm_attrition
+    FROM
+        (SELECT -- Nested query to assign the program criteria since it differs per apm
+            combo_company_id,
+            snapshot_dt,
+            CASE WHEN apm_l3 = 'Social, Audience, Advertising (EOS)' THEN 'Social, Audience, Advertising (EOS)'
+                 WHEN apm_l2 = 'Agentforce' THEN 'Agentforce, Flex Credits'
+                 WHEN apm_l2 = 'Flex Credits' THEN 'Agentforce, Flex Credits'
+                 WHEN apm_l3 = 'B2C Commerce (B2Ce)' THEN 'B2C Commerce (B2Ce)'
+                 WHEN apm_l2 = 'CRM Analytics' THEN 'CRM Analytics'
+                 WHEN apm_l3 IN ('Super Messages','Marketing on Core') THEN 'Super Messages'
+                 WHEN apm_l3 = 'WhatsApp Business Messaging' THEN 'WhatsApp Business Messaging'
+                 ELSE NULL END AS apm_criteria,
+            SUM(IFNULL(attrition,0)) AS attrition
+        FROM sse_dm_csg_rpt_prd.cidm.wv_ci_acct_product_apm_vw
+        GROUP BY 1,2,3
+        ) a
+    WHERE a.apm_criteria IS NOT NULL
+    GROUP BY ALL
+),
+
+-- Cloud level attrition snapshots at cloud granularity
+cloud AS (
+    SELECT
+        combo_company_id,
+        snapshot_dt,
+        attrition_cloud,
+        SUM(IFNULL(attrit_decrease_aov_plan_fx, 0)) AS cloud_attrition
+    FROM sse_dm_csg_rpt_prd.cidm.ci_fact_attrition_history_vw
+    GROUP BY 1,2,3
+),
+
+-- Signature specific attrition
+sig_attrition AS (
+    SELECT
+        combo_company_id,
+        snapshot_dt,
+        SUM(IFNULL(snap_signature_attrition,0)) AS sig_attrition
+    FROM sse_dm_csg_rpt_prd.cidm.ci_premier_attrition_vw
+    GROUP BY 1,2
+),
+
+-- PRODUCT AOV
+-- Targeted product AOV
+target_prod_aov AS (
+    SELECT
+        p.global_co_combo_id,
+        ADD_MONTHS(p.dt_key, -1) AS dt_key,
+        CASE WHEN f.value::STRING = 'Agentforce' THEN 'Agentforce, Flex Credits'
+             WHEN f.value::STRING = 'Flex Credits' THEN 'Agentforce, Flex Credits'
+             ELSE f.value::STRING END AS aov_criteria,
+        ROUND(SUM(p.alloc_aov),2) AS prod_aov
+    FROM fact_aov_base p,
+    LATERAL FLATTEN(input => p.matched_products_array) f
+    GROUP BY ALL
+),
+
+-- Preferred product AOV for swap programs
+preferred_prod_aov_detail AS (
+    SELECT
+        global_co_combo_id,
+        dt_key,
+        -- Evaluate all conditions and pack the matched alias names into an array
+        ARRAY_CONSTRUCT_COMPACT(
+            CASE WHEN prod_sku IN ('200004873','200007031','200002454') THEN 'D360' END,
+            CASE WHEN prod_sku IN ('200000682', '200000684', '200002502', '200002922', '200003669', '200002924',
+                '200002921', '200002917', '200002923', '200002920', '200002925', '200002919',
+                '200002918', '200003620', '200003626', '200003615', '200003616', '200003622',
+                '200003621', '200003628', '200003627', '8200003620', '8200003626', '8200003622',
+                '8200003628', '200002365', '200002368', '200002366', '200002369', '200002364',
+                '200002367', '200001825', '200001824', '200001822', '200001820', '200001821',
+                '200001817', '200001818', '200001823', '200001819', '200001594', '200002032',
+                '8200002116', '200001952', '200002236', '200002051', '200002058', '200001923',
+                '200002030', '200001590', '200002069', '8200002114', '8200002303', '200002305',
+                '200001793', '200002287', '200002053', '100004809', '200002072', '200002029',
+                '100004798', '200001791', '100004766', '100004771', '200007675', '100004799',
+                '200002333', '200002084', '100004802', '200001933', '200001918', '100004790',
+                '200002237', '200001592', '200001593', '200001941', '100004779', '200001949',
+                '8200002096', '200001898', '200002299', '200001790', '200002068', '100003093',
+                '200001950', '200002027', '200002102', '200007676', '200002337', '200002335',
+                '200001925', '200001921', '100004806', '200002294', '200002672', '8200007673',
+                '200001953', '200001915', '200001937', '8200002692', '8200002289', '200001540',
+                '200002073', '200002096', '200002059', '100004810', '200002314', '200002048',
+                '200002681', '200001539', '200001984', '100004807', '200002024', '8200002694',
+                '100004780', '200001893', '200001774', '200001536', '200002360', '200002076',
+                '100004795', '200002323', '200002685', '200001927', '200001797', '200002043',
+                '200001943', '200002239', '200002028', '200002698', '100004772', '200002677',
+                '8200002287', '200002310', '100004778', '8200007677', '200002306', '200002094',
+                '200001954', '8200001991', '200002682', '200001803', '200001795', '200002312',
+                '100004823', '200001242', '200001899', '200002679', '200002255', '200002334',
+                '100004794', '8200002691', '200002292', '200002691', '200001900', '200002225',
+                '100004774', '200002301', '200002308', '200001894', '200007672', '200001788',
+                '200001897', '200001538', '200002220', '200001895', '200002238', '200002031',
+                '200002222', '200002688', '200002343', '200002694', '200002033', '200001926',
+                '200001930', '200001980', '200002686', '100004785', '200001908', '200001587',
+                '200001969', '100004770', '100004761', '8200007689', '100004792', '200002112',
+                '200002050', '200001243', '200001543', '200001982', '200001770', '200001588',
+                '8200002112', '200002235', '200002683', '200002095', '200002023', '200001786',
+                '200001800', '200001961', '100004813', '200001784', '200001796', '200002252',
+                '200007670', '200002356', '100004773', '200001968', '200001781', '100004775',
+                '100004767', '200002037', '200002101', '200002342', '200001938', '200001922',
+                '200002692', '200002338', '200002318', '200001802', '100004816', '200001783',
+                '100004801', '200002676', '200001891', '200002041', '8200001990', '200002042',
+                '200001978', '200001956', '100004769', '200007688', '200002022', '200001495',
+                '200001585', '200001773', '200002099', '200001990', '8200001589', '200001586',
+                '200002055', '200001903', '200001945', '100004796', '200002303', '8200001588',
+                '200001931', '100004805', '200002116', '200001778', '200001967', '200002110',
+                '200002253', '100004822', '100004791', '200002092', '200001535', '200002675',
+                '200002100', '200001944', '100004819', '8200002682', '200007677', '100004762',
+                '100004793', '200001775', '200002336', '100004789', '200002354', '200002039',
+                '200002344', '200002240', '200002061', '100004804', '200002695', '200001799',
+                '200001780', '8200002299', '200002056', '200002355', '200002040', '100004784',
+                '200002291', '100004812', '200002345', '100004817', '200001993', '200002684',
+                '8200001591', '200002315', '200002251', '200002049', '100004821', '200007685',
+                '200001934', '200002254', '100004781', '100004811', '8200001993', '8200007683',
+                '200002316', '200001792', '200001942', '200002224', '100004818', '200002070',
+                '200001962', '200001955', '200002257', '200001798', '8200002358', '200002044',
+                '200001929', '8200002679', '200002021', '200002353', '200002324', '200001591',
+                '200001939', '200002687', '200001916', '100004808', '200001919', '200001794',
+                '200002223', '8200007670', '200002115', '200002221', '200002351', '8200007676',
+                '8200002292', '200007680', '200002025', '200002317', '200002114', '8200002110',
+                '200001917', '200002346', '200002117', '200002250', '200002697', '8200002294',
+                '200001782', '200002045', '200002026', '200001905', '200002689', '200002103',
+                '200007681', '200002054', '8200002680', '200002036', '200002326', '200001932',
+                '200001589', '100004155', '8200002312', '200002060', '200001924', '200001771',
+                '200001801', '200002098', '200007678', '100004820', '200001892', '200002340',
+                '200001902', '100004786', '200001541', '200007686', '200001972', '100004764',
+                '200001946', '200001906', '100004800', '200001920', '200002111', '200002289',
+                '100004765', '8200002297', '200002057', '200001992', '8200002683', '200007682',
+                '100004760', '100004814', '200002349', '200001890', '8200002689', '100004815',
+                '8200002308', '200002352', '200001976', '200001947', '200001974', '8200007688',
+                '200002052', '100004768', '200002038', '100002536', '200002296', '100004783',
+                '200001928', '200001957', '200002077', '200001948', '200001958', '200001789',
+                '200001912', '200007679', '200001772', '200001911', '200001537', '200002097',
+                '200002690', '200001779', '200001776', '200001804', '100004782', '200001787',
+                '8200002349', '200002680', '200002673', '200001986', '200001936', '200002258',
+                '200002693', '200007689', '200002325', '200002093', '200002020', '100004776',
+                '200007673', '200002696', '200002358', '200001960', '200001970', '200001991',
+                '200001914', '200001907', '100004777', '200002674', '8200001992', '100004763',
+                '200001777', '8200002306', '200001542', '200002113', '8200007686', '200007683',
+                '200002347', '100004797', '200002339', '200001940', '200001935', '100004788',
+                '200002332', '100004787', '200002297', '200001785', '200002341', '200002071',
+                '100004803', '200002678', '200013691', '200013690', '200002106', '200003184',
+                '200003183', '200003934', '200003929', '200003927', '200003928', '200003931',
+                '200003937', '200003930', '200003932', '200003935', '200003933', '200003936',
+                '100004975', '100004974', '100004976', '100004977', '200005232', '200005231',
+                '200005228', '200005229', '200005230', '200005233', '200005241', '200005240',
+                '200005245', '200005242', '200005243', '200005244', '200005237', '200005239',
+                '200005238', '200005234', '200005236', '200005235', '200005246', '200005247',
+                '200005248', '200005249', '200005251', '200005250', '200005252', '200005253',
+                '200005254', '200005221', '200005222', '200005225', '200005226', '200005227',
+                '200005224', '200005223', '200004107', '200004108', '200004109', '200004110',
+                '200004111', '200004112', '200004114', '200004113', '200004115', '200004874',
+                '100006239', '200003679', '200003680', '200003681', '200003682', '200003683',
+                '200003684', '200001881', '200001882', '200003865', '200003870', '200003862',
+                '200003863', '200003864', '200003866', '200003867', '200003868', '200003869',
+                '200003871', '200003872', '200003873', '200008951', '200008952', '200008953',
+                '200008954', '200008955', '200008956', '200008957', '200008958', '200008959',
+                '200008960', '200008961', '200008962', '200008963', '200008964', '200008965',
+                '200007200', '200007202', '200007201', '200007203', '200008966', '200008967',
+                '200008968', '200008969', '200008970', '200008971', '200008972', '200008973',
+                '200008974', '200008975', '200008976', '200008977', '200008978', '200008979',
+                '200008980', '200008981', '200008982', '200008984', '200008983', '200008985',
+                '200008986', '200008987', '200008988', '200008989', '200008990', '200008991',
+                '200008992', '9999174389', '100006494', '100006495', '100006496', '100006497',
+                '100006498', '100006499', '100006500', '100006501') THEN 'Tableau' END,
+            CASE WHEN prod_sku IN ('200007230', '200007231', '200007232', '200007233', '200007234', '200007235',
+                '200007236', '200007237', '200007238', '200007240', '200007241', '200007242') THEN 'INFA' END
+        ) AS matched_products_array,
+        IFNULL(alloc_aov, 0) AS alloc_aov
+    FROM edw_heritage_prd.dm.fact_aov_ss_vw
+),
+
+-- Final targeted product results with a single column
+preferred_prod_aov AS (
+    SELECT
+        p.global_co_combo_id,
+        ADD_MONTHS(p.dt_key, -1) as dt_key,
+        f.value::STRING AS aov_criteria, -- Extract the product alias from the flattened array
+        ROUND(SUM(p.alloc_aov),2) AS prod_aov
+    FROM preferred_prod_aov_detail p,
+    LATERAL FLATTEN(input => p.matched_products_array) f -- FLATTEN takes the array and creates a new row for each product match
+    GROUP BY ALL
+),
+
+-- Company level AOV
+total_aov AS (
+    SELECT
+        global_co_combo_id,
+        ADD_MONTHS(dt_key, -1) as dt_key,
+        SUM(IFNULL(alloc_aov,0)) AS total_aov
+    FROM edw_heritage_prd.dm.fact_aov_ss_vw
+    GROUP BY ALL
+),
+
+-- NEW: total product ATR by dimension for Prod Reach % denominator
+total_prod_atr AS (
+    SELECT product, SALES_OU, SALES_OU_1, aov_band, macro_segment, renewal_fiscal_qtr,
+           SUM(total_prod_atr) AS total_prod_atr
+    FROM (
+        SELECT pc.product,
+               rd.SALES_OU, rd.SALES_OU_1,
+               rd.ACCT_AOV_BAND      AS aov_band,
+               rd.MACRO_SEGMENT      AS macro_segment,
+               rd.RENEWAL_FISCAL_QTR AS renewal_fiscal_qtr,
+               SUM(pc.prod_atr)      AS total_prod_atr
+        FROM renewal_detail rd
+        INNER JOIN prod_cntr pc ON pc.opp_id_15 = rd.opp_id_15
+        GROUP BY 1,2,3,4,5,6
+
+        UNION ALL
+
+        SELECT p1.product,
+               rd.SALES_OU, rd.SALES_OU_1,
+               rd.ACCT_AOV_BAND      AS aov_band,
+               rd.MACRO_SEGMENT      AS macro_segment,
+               rd.RENEWAL_FISCAL_QTR AS renewal_fiscal_qtr,
+               SUM(p1.prod_atr)      AS total_prod_atr
+        FROM renewal_detail rd
+        INNER JOIN fact_aov_atr_2 p1
+            ON p1.cntr_id = LEFT(rd.RENEWAL_PRIOR_CNTR_ID, 15)
+            AND p1.dt_key = DATE_TRUNC('month', DATEADD('month', -1, rd.RENEWAL_CLOSE_MONTH))
+        WHERE rd.opp_id_15 NOT IN (SELECT DISTINCT opp_id_15 FROM prod_cntr)
+        GROUP BY 1,2,3,4,5,6
+    ) sub
+    GROUP BY 1,2,3,4,5,6
+)
+
+SELECT
+    t.*,
+
+    -- Attrition
+    ROUND(IFNULL(a.apm_attrition,0),2) AS apm_attrition,
+    ROUND(IFNULL(c.cloud_attrition,0),2) AS cloud_attrition,
+    ROUND(IFNULL(sa.sig_attrition,0),2) AS sig_attrition,
+
+    DATE_TRUNC('month', DATEADD('month', -1,t.renewal_close_month))::DATE AS renewal_month_prior,
+    DATE_TRUNC('month', DATEADD('month', 1, t.renewal_close_month))::DATE AS renewal_month_next,
+
+    -- New Prod ATR fallback strategy: Prefer SELA-mapped Prod ATR, otherwise fallback to contract logic
+    ROUND(pc.prod_atr,2) AS prod_atr_main,
+    ROUND(p1.prod_atr,2) AS prod_atr_contract,
+    ROUND(COALESCE(pc.prod_atr, p1.prod_atr, 0), 2) AS prod_atr,
+
+    -- Total product ATR denominator for Prod Reach %
+    tp.total_prod_atr,
+
+    -- Product AOV
+    ROUND(IFNULL(sos.prod_aov,0),2) AS target_prod_prior_month_aov,
+    ROUND(IFNULL(soe.prod_aov,0),2) AS target_prod_next_month_aov,
+    ROUND(IFNULL(sis.prod_aov,0),2) AS preferred_prod_prior_month_aov,
+    ROUND(IFNULL(sie.prod_aov,0),2) AS preferred_prod_next_month_aov,
+    ROUND(IFNULL(tas.total_aov,0),2) AS total_prior_month_aov,
+    ROUND(IFNULL(tae.total_aov,0),2) AS total_next_month_aov,
+
+    MAX(a.snapshot_dt) AS data_thru_apm,
+    MAX(c.snapshot_dt) AS data_thru_cloud,
+    MAX(sa.snapshot_dt) AS data_thru_sig,
+    MAX(tas.dt_key) AS data_thru_fact_aov
+FROM programs_opty_renewals t
+
+-- Attrition values
+LEFT JOIN apm a ON a.combo_company_id = t.combo_company_id AND a.apm_criteria = t.apm_attrit_aov_map AND a.snapshot_dt = t.renewal_close_month
+LEFT JOIN cloud c ON c.combo_company_id = t.combo_company_id AND c.attrition_cloud = t.cloud_attrit_map AND c.snapshot_dt = t.renewal_close_month
+LEFT JOIN sig_attrition sa ON sa.combo_company_id = t.combo_company_id AND sa.snapshot_dt = t.renewal_close_month AND t.apm_attrit_aov_map = 'Signature'
+
+-- Product ATR New Integrated SELA Logic Match + fallback join if PC misses
+LEFT JOIN prod_cntr pc ON pc.opp_id_15 = t.opportunity_id AND pc.product = t.apm_attrit_aov_map
+LEFT JOIN fact_aov_atr_2 p1 ON p1.cntr_id = LEFT(t.cntr_id,15) AND p1.product = t.apm_attrit_aov_map AND p1.dt_key = renewal_month_prior
+
+-- target product AOV
+LEFT JOIN target_prod_aov sos ON sos.global_co_combo_id = t.combo_company_id AND sos.dt_key = renewal_month_prior AND sos.aov_criteria = t.apm_attrit_aov_map
+LEFT JOIN target_prod_aov soe ON soe.global_co_combo_id = t.combo_company_id AND soe.dt_key = renewal_month_next AND soe.aov_criteria = t.apm_attrit_aov_map
+
+-- Preferred swap in product AOV
+LEFT JOIN preferred_prod_aov sis ON sis.global_co_combo_id = t.combo_company_id AND sis.dt_key = renewal_month_prior AND sis.aov_criteria = t.prod_swap_in_map
+LEFT JOIN preferred_prod_aov sie ON sie.global_co_combo_id = t.combo_company_id AND sie.dt_key = renewal_month_next AND sie.aov_criteria = t.prod_swap_in_map
+
+-- Total company AOV
+LEFT JOIN total_aov tas ON tas.global_co_combo_id = t.combo_company_id AND tas.dt_key = renewal_month_prior
+LEFT JOIN total_aov tae ON tae.global_co_combo_id = t.combo_company_id AND tae.dt_key = renewal_month_next
+
+--Total product ATR
+LEFT JOIN total_prod_atr tp
+    ON  tp.product            = t.apm_attrit_aov_map
+    AND tp.SALES_OU           = t.Sales_OU
+    AND tp.SALES_OU_1         = t.Sales_OU_1
+    AND tp.aov_band           = t.ACCT_AOV_BAND
+    AND tp.macro_segment      = t.MACRO_SEGMENT
+    AND tp.renewal_fiscal_qtr = t.RENEWAL_FISCAL_QTR
+
+GROUP BY ALL
