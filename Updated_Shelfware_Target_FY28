@@ -1,0 +1,217 @@
+ WITH shelfware_summary AS (
+        SELECT
+            account_id,
+            -- Fix #1: collapse Tableau sub_categories to match adoption_cohorts
+            CASE WHEN sub_category_final LIKE '%Tableau%' THEN 'Tableau'
+                 ELSE sub_category_final
+            END AS sub_category_final,
+            CASE WHEN sub_category_final LIKE '%Tableau%' THEN 'Tableau'
+                 ELSE drvd_prod_lvl_1
+            END AS drvd_prod_lvl_1,
+            drvd_prod_lvl_2,
+            drvd_prod_lvl_3,
+            snapshot_dt,
+            SUM(total_aov) AS total_aov,
+            SUM(total_shelfware_aov) AS shelfware_aov
+        FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.SHELFWARE_ARI_SUMMARY
+        WHERE snapshot_dt = '2026-07-01'
+          AND sub_category_final <> 'Tableau Server Analytics'       -- Exclusion: Tab Server
+        GROUP BY ALL
+    ),
+
+    adoption_cohorts AS (
+        -- Fix #2: dedup collapsed sub_categories, pick worst cohort
+        SELECT
+            account_id,
+            snapshot_dt,
+            sub_category_final,
+            MIN(CASE WHEN adoption_cohort_status = 'Unhealthy' THEN 'Unhealthy'
+                     ELSE 'Healthy' END) AS adoption_cohort_status,
+            MIN_BY(executive_cohort,
+                CASE executive_cohort
+                    WHEN 'No Usage' THEN 1
+                    WHEN 'Low Usage' THEN 2
+                    WHEN 'Declining Usage' THEN 3
+                    ELSE 4
+                END
+            ) AS executive_cohort
+        FROM (
+            SELECT
+                account_id,
+                snapshot_dt,
+                CASE
+                    WHEN sub_category IN ('B2B Order Management - Industries',
+                         'B2C Order Management - Industries') THEN 'Order Management'
+                    WHEN sub_category IN ('MuleSoft Integration - Flows/Messages')
+                         THEN 'MuleSoft Integration'
+                    WHEN sub_category IN ('Slack AI','Slack Elevate') THEN 'Slack'  -- Fix #3: typo corrected
+                    WHEN sub_category LIKE '%Tableau%' THEN 'Tableau'
+                    ELSE sub_category
+                END AS sub_category_final,
+                CASE
+                    WHEN executive_cohort IN ('No Usage','Low Usage','Declining Usage') THEN 'Unhealthy'
+                    WHEN executive_cohort IN ('Consistent Usage','Growing Usage') THEN 'Healthy'
+                    ELSE 'Other'                                     -- Fix #4: New/N/A no longer counted as Healthy
+                END AS adoption_cohort_status,
+                executive_cohort
+            FROM SSE_DM_CSG_RPT_PRD.OFFERS_DE.SHELFWARE_ADOPTION_COHORTS
+            WHERE snapshot_dt = '2026-07-01'
+              AND COALESCE(TRY_TO_BOOLEAN(is_sela), FALSE) = FALSE
+              AND sub_category <> 'Tableau Server Analytics'         -- Exclusion: Tab Server
+        )
+        GROUP BY account_id, snapshot_dt, sub_category_final
+    ),
+
+    account_segment AS (
+        SELECT
+            acct_id,
+            MAX(csg_territory) AS csg_territory
+        FROM SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW
+        GROUP BY acct_id
+    ),
+
+    shelfware_base AS (
+        SELECT
+            s.account_id,
+            s.drvd_prod_lvl_1,
+            seg.csg_territory,
+            SUM(s.total_aov) AS total_aov,
+            SUM(s.shelfware_aov) AS shelfware_aov,
+            LISTAGG(
+                s.sub_category_final || ' (' || a.executive_cohort || ': $' ||
+                TO_CHAR(s.shelfware_aov, '999,999,999') || ')',
+                ' | '
+            ) WITHIN GROUP (ORDER BY s.shelfware_aov DESC) AS unhealthy_cohort_details
+        FROM shelfware_summary s
+        INNER JOIN adoption_cohorts a
+            ON  s.account_id         = a.account_id
+            AND s.sub_category_final = a.sub_category_final
+            AND s.snapshot_dt        = a.snapshot_dt
+        LEFT JOIN account_segment seg
+            ON s.account_id = seg.acct_id
+        WHERE a.adoption_cohort_status = 'Unhealthy'
+          AND s.drvd_prod_lvl_1 IS NOT NULL
+          AND s.shelfware_aov > 0
+        GROUP BY ALL
+        HAVING SUM(s.shelfware_aov) >= CASE
+            WHEN seg.csg_territory = 'SMB' THEN 50000
+            ELSE 200000
+        END
+    ),
+
+    all_opps AS (
+        SELECT
+            sb.account_id,
+            sb.drvd_prod_lvl_1,
+            sb.csg_territory,
+            sb.total_aov,
+            sb.shelfware_aov,
+            sb.unhealthy_cohort_details,
+            rn.renewal_opty_id,
+            rn.renewal_opty_nm,
+            rn.renewal_opty_ownr_nm,
+            rn.renewal_atr_conv,
+            rn.renewal_close_month,
+            rn.renewal_fiscal_qtr,
+            rn.renewal_stg_nm,
+            rn.renewal_fcast_attrition_conv,
+            rn.auto_renewal,
+            rn.rm_brand,
+            rn.target_cloud,
+            ROW_NUMBER() OVER (
+                PARTITION BY sb.account_id, sb.drvd_prod_lvl_1, rn.renewal_opty_id
+                ORDER BY rn.renewal_stg_nm DESC
+            ) AS stage_rank
+        FROM shelfware_base sb
+        INNER JOIN SSE_DM_CSG_RPT_PRD.RENEWALS.WV_CI_RENEWAL_OPTY_VW rn
+            ON  rn.acct_id = sb.account_id
+            AND rn.renewal_fiscal_year IN (2027, 2028)               -- kept as requested
+            AND rn.renewal_fiscal_qtr IN ('FY2028Q1','FY2028Q2')
+            AND rn.renewal_fcast_code <> 'Omitted'
+            AND rn.renewal_opty_type IN ('Renewal', 'Contract')
+            AND rn.renewal_fcast_attrition_conv <= 0
+            AND rn.renewal_atr_conv >= CASE
+                WHEN sb.csg_territory = 'SMB' THEN 25000
+                ELSE 50000
+            END
+            AND rn.csg_territory NOT IN ('JP', 'GCR')               -- Exclusion: Japan & GCR
+            AND rn.auto_renewal <> 'Yes'                             -- Exclusion: Auto Renew Yes
+            AND (rn.rm_brand = 'Tableau') = (sb.drvd_prod_lvl_1 = 'Tableau')  -- Fix #5: symmetric brand match
+    ),
+
+    account_true_shelfware AS (
+        SELECT
+            account_id,
+            SUM(shelfware_aov) AS total_account_shelfware
+        FROM (
+            SELECT DISTINCT account_id, drvd_prod_lvl_1, shelfware_aov
+            FROM all_opps
+            WHERE stage_rank = 1
+        )
+        GROUP BY account_id
+    ),
+
+    deduped_oppty AS (
+        SELECT
+            r.account_id,
+            r.drvd_prod_lvl_1,
+            r.csg_territory,
+            r.total_aov,
+            r.shelfware_aov,
+            r.unhealthy_cohort_details,
+            r.renewal_opty_id,
+            r.renewal_opty_nm,
+            r.renewal_opty_ownr_nm,
+            r.renewal_atr_conv,
+            r.renewal_close_month,
+            r.renewal_fiscal_qtr,
+            r.renewal_stg_nm,
+            r.renewal_fcast_attrition_conv,
+            r.auto_renewal,
+            r.rm_brand,
+            r.target_cloud,
+            ats.total_account_shelfware,
+            ROW_NUMBER() OVER (
+                PARTITION BY r.renewal_opty_id
+                ORDER BY r.shelfware_aov DESC, r.drvd_prod_lvl_1 ASC
+            ) AS oppty_dedup_rank
+        FROM all_opps r
+        LEFT JOIN account_true_shelfware ats
+            ON r.account_id = ats.account_id
+        WHERE r.stage_rank = 1
+    ),
+
+    deduped_acct AS (
+        SELECT
+            *,
+            ROW_NUMBER() OVER (
+                PARTITION BY account_id
+                ORDER BY shelfware_aov DESC, renewal_opty_id ASC
+            ) AS acct_dedup_rank
+        FROM deduped_oppty
+        WHERE oppty_dedup_rank = 1
+    )
+
+    SELECT
+        account_id,
+        drvd_prod_lvl_1,
+        csg_territory,
+        total_aov,
+        shelfware_aov,
+        unhealthy_cohort_details,
+        renewal_opty_id,
+        renewal_opty_nm,
+        renewal_opty_ownr_nm,
+        renewal_atr_conv,
+        renewal_close_month,
+        renewal_fiscal_qtr,
+        renewal_stg_nm,
+        renewal_fcast_attrition_conv,
+        auto_renewal,
+        rm_brand,
+        target_cloud,
+        total_account_shelfware
+    FROM deduped_acct
+    WHERE acct_dedup_rank = 1
+    ORDER BY csg_territory, shelfware_aov DESC;
+
